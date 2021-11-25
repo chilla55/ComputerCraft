@@ -15,129 +15,105 @@ import dan200.computercraft.core.apis.ILuaAPI;
 import dan200.computercraft.core.computer.Computer;
 import dan200.computercraft.core.computer.ITask;
 import dan200.computercraft.core.computer.MainThread;
-import org.squiddev.cobalt.*;
-import org.squiddev.cobalt.compiler.CompileException;
-import org.squiddev.cobalt.compiler.LoadState;
-import org.squiddev.cobalt.debug.DebugFrame;
-import org.squiddev.cobalt.debug.DebugHandler;
-import org.squiddev.cobalt.debug.DebugState;
-import org.squiddev.cobalt.function.LibFunction;
-import org.squiddev.cobalt.function.LuaFunction;
-import org.squiddev.cobalt.function.VarArgFunction;
-import org.squiddev.cobalt.lib.*;
-import org.squiddev.cobalt.lib.platform.AbstractResourceManipulator;
+
+import org.luaj.vm2.*;
+import org.luaj.vm2.lib.OneArgFunction;
+import org.luaj.vm2.lib.VarArgFunction;
+import org.luaj.vm2.lib.ZeroArgFunction;
+import org.luaj.vm2.lib.jse.JsePlatform;
 
 import javax.annotation.Nonnull;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
-import static org.squiddev.cobalt.Constants.NONE;
-import static org.squiddev.cobalt.ValueFactory.valueOf;
-import static org.squiddev.cobalt.ValueFactory.varargsOf;
-
-public class CobaltLuaMachine implements ILuaMachine
+public class LuaJLuaMachine implements ILuaMachine
 {
-    private final Computer m_computer;
+    private Computer m_computer;
 
-    private final LuaState m_state;
-    private final LuaTable m_globals;
-
-    private LuaThread m_mainRoutine;
+    private LuaValue m_globals;
+    private LuaValue m_loadString;
+    private LuaValue m_assert;
+    private LuaValue m_coroutine_create;
+    private LuaValue m_coroutine_resume;
+    private LuaValue m_coroutine_yield;
+    
+    private LuaValue m_mainRoutine;
     private String m_eventFilter;
     private String m_softAbortMessage;
     private String m_hardAbortMessage;
 
-    public CobaltLuaMachine( Computer computer )
+    private Map<Object, LuaValue> m_valuesInProgress;
+    private Map<LuaValue, Object> m_objectsInProgress;
+
+    public LuaJLuaMachine( Computer computer )
     {
         m_computer = computer;
 
         // Create an environment to run in
-        final LuaState state = this.m_state = new LuaState( new AbstractResourceManipulator()
-        {
+        m_globals = JsePlatform.debugGlobals();
+        m_loadString = m_globals.get("loadstring");
+        m_assert = m_globals.get("assert");
+
+        LuaValue coroutine = m_globals.get("coroutine");
+        final LuaValue native_coroutine_create = coroutine.get("create");
+        
+        LuaValue debug = m_globals.get("debug");
+        final LuaValue debug_sethook = debug.get("sethook");
+        
+        coroutine.set("create", new OneArgFunction() {
             @Override
-            public InputStream findResource( String filename )
+            public LuaValue call( LuaValue value )
             {
-                return null;
+                final LuaThread thread = native_coroutine_create.call( value ).checkthread();
+                debug_sethook.invoke( new LuaValue[] {
+                    thread,
+                    new ZeroArgFunction() {
+                        @Override
+                        public LuaValue call() {
+                            String hardAbortMessage = m_hardAbortMessage;
+                            if( hardAbortMessage != null )
+                            {
+                                LuaThread.yield(LuaValue.NIL);
+                            }
+                            return LuaValue.NIL;
+                        }
+                    },
+                    LuaValue.NIL,
+                    LuaValue.valueOf(100000)
+                } );
+                return thread;                
             }
-        } );
-        state.debug = new DebugHandler( state )
-        {
-            private int count = 0;
-            private boolean hasSoftAbort;
-
-            @Override
-            public void onInstruction( DebugState ds, DebugFrame di, int pc, Varargs extras, int top ) throws LuaError
-            {
-                int count = ++this.count;
-                if( count > 100000 )
-                {
-                    if( m_hardAbortMessage != null ) LuaThread.yield( state, NONE );
-                    this.count = 0;
-                }
-                else
-                {
-                    handleSoftAbort();
-                }
-
-                super.onInstruction( ds, di, pc, extras, top );
-            }
-
-            @Override
-            public void poll() throws LuaError
-            {
-                if( m_hardAbortMessage != null ) LuaThread.yield( state, NONE );
-                handleSoftAbort();
-            }
-
-            private void handleSoftAbort() throws LuaError {
-                // If the soft abort has been cleared then we can reset our flags and continue.
-                String message = m_softAbortMessage;
-                if (message == null) {
-                    hasSoftAbort = false;
-                    return;
-                }
-
-                if (hasSoftAbort && m_hardAbortMessage == null) {
-                    // If we have fired our soft abort, but we haven't been hard aborted then everything is OK.
-                    return;
-                }
-
-                hasSoftAbort = true;
-                throw new LuaError(message);
-            }
-        };
-
-        m_globals = new LuaTable();
-        state.setupThread( m_globals );
-
-        // Add basic libraries
-        m_globals.load( state, new BaseLib() );
-        m_globals.load( state, new TableLib() );
-        m_globals.load( state, new StringLib() );
-        m_globals.load( state, new MathLib() );
-        m_globals.load( state, new CoroutineLib() );
-
-        // Register custom load/loadstring provider which automatically adds prefixes.
-        LibFunction.bind( state, m_globals, PrefixLoader.class, new String[]{ "load", "loadstring" } );
-
+        });
+        
+        m_coroutine_create = coroutine.get("create");
+        m_coroutine_resume = coroutine.get("resume");
+        m_coroutine_yield = coroutine.get("yield");
+        
         // Remove globals we don't want to expose
-        m_globals.rawset( "collectgarbage", Constants.NIL );
-        m_globals.rawset( "dofile", Constants.NIL );
-        m_globals.rawset( "loadfile", Constants.NIL );
-        m_globals.rawset( "print", Constants.NIL );
+        m_globals.set( "collectgarbage", LuaValue.NIL );
+        m_globals.set( "dofile", LuaValue.NIL );
+        m_globals.set( "loadfile", LuaValue.NIL );
+        m_globals.set( "module", LuaValue.NIL );
+        m_globals.set( "require", LuaValue.NIL );
+        m_globals.set( "package", LuaValue.NIL );        
+        m_globals.set( "io", LuaValue.NIL );
+        m_globals.set( "os", LuaValue.NIL );
+        m_globals.set( "print", LuaValue.NIL );
+        m_globals.set( "luajava", LuaValue.NIL );
+        m_globals.set( "debug", LuaValue.NIL );
+        m_globals.set( "newproxy", LuaValue.NIL );
+        m_globals.set( "__inext", LuaValue.NIL );
 
         // Add version globals
-        m_globals.rawset( "_VERSION", valueOf( "Lua 5.1" ) );
-        m_globals.rawset( "_HOST", valueOf( computer.getAPIEnvironment().getComputerEnvironment().getHostString() ) );
-        m_globals.rawset( "_CC_DEFAULT_SETTINGS", valueOf( ComputerCraft.default_computer_settings ) );
+        m_globals.set( "_VERSION", "Lua 5.1" );
+        m_globals.set( "_HOST", computer.getAPIEnvironment().getComputerEnvironment().getHostString() );
+        m_globals.set( "_CC_DEFAULT_SETTINGS", toValue( ComputerCraft.default_computer_settings ) );
         if( ComputerCraft.disable_lua51_features )
         {
-            m_globals.rawset( "_CC_DISABLE_LUA51_FEATURES", Constants.TRUE );
+            m_globals.set( "_CC_DISABLE_LUA51_FEATURES", toValue( true ) );
         }
 
         // Our main function will go here
@@ -147,7 +123,7 @@ public class CobaltLuaMachine implements ILuaMachine
         m_softAbortMessage = null;
         m_hardAbortMessage = null;
     }
-
+    
     @Override
     public void addAPI( ILuaAPI api )
     {
@@ -156,10 +132,10 @@ public class CobaltLuaMachine implements ILuaMachine
         String[] names = api.getNames();
         for( String name : names )
         {
-            m_globals.rawset( name, table );
+            m_globals.set( name, table );
         }
     }
-
+    
     @Override
     public void loadBios( InputStream bios )
     {
@@ -168,31 +144,56 @@ public class CobaltLuaMachine implements ILuaMachine
         {
             return;
         }
-
+        
         try
         {
-            LuaFunction value = LoadState.load( m_state, bios, "@bios.lua", m_globals );
-            m_mainRoutine = new LuaThread( m_state, value, m_globals );
-        }
-        catch( CompileException e )
-        {
-            if( m_mainRoutine != null )
+            // Read the whole bios into a string
+            String biosText;
+            try
             {
-                m_mainRoutine.abandon();
-                m_mainRoutine = null;
+                InputStreamReader isr;
+                try
+                {
+                    isr = new InputStreamReader( bios, "UTF-8" );
+                }
+                catch( UnsupportedEncodingException e )
+                {
+                    isr = new InputStreamReader( bios );
+                }
+                BufferedReader reader = new BufferedReader( isr );
+                StringBuilder fileText = new StringBuilder( "" );
+                String line = reader.readLine();
+                while( line != null ) {
+                    fileText.append( line );
+                    line = reader.readLine();
+                    if( line != null ) {
+                        fileText.append( "\n" );
+                    }
+                }
+                biosText = fileText.toString();
             }
+            catch( IOException e )
+            {
+                throw new LuaError( "Could not read file" );
+            }
+            
+            // Load it
+            LuaValue program = m_assert.call( m_loadString.call( 
+                toValue( biosText ), toValue( "bios.lua" )
+            ));
+            m_mainRoutine = m_coroutine_create.call( program );
         }
-        catch( IOException e )
+        catch( LuaError e )
         {
             ComputerCraft.log.warn( "Could not load bios.lua ", e );
             if( m_mainRoutine != null )
             {
-                m_mainRoutine.abandon();
+                ((LuaThread)m_mainRoutine).abandon();
                 m_mainRoutine = null;
             }
         }
     }
-
+    
     @Override
     public void handleEvent( String eventName, Object[] arguments )
     {
@@ -205,28 +206,35 @@ public class CobaltLuaMachine implements ILuaMachine
         {
             return;
         }
-
+        
         try
-        {
-            Varargs resumeArgs = Constants.NONE;
+        {            
+            LuaValue[] resumeArgs;
             if( eventName != null )
             {
-                resumeArgs = varargsOf( valueOf( eventName ), toValues( arguments ) );
-            }
-
-            Varargs results = m_mainRoutine.resume( resumeArgs );
-            if( m_hardAbortMessage != null )
-            {
-                throw new LuaError( m_hardAbortMessage );
-            }
-            else if( !results.first().checkBoolean() )
-            {
-                throw new LuaError( results.arg( 2 ).checkString() );
+                resumeArgs = toValues( arguments, 2 );
+                resumeArgs[0] = m_mainRoutine;
+                resumeArgs[1] = toValue( eventName );
             }
             else
             {
-                LuaValue filter = results.arg( 2 );
-                if( filter.isString() )
+                resumeArgs = new LuaValue[1];
+                resumeArgs[0] = m_mainRoutine;
+            }
+            
+            Varargs results = m_coroutine_resume.invoke( LuaValue.varargsOf( resumeArgs ) );
+            if( m_hardAbortMessage != null ) 
+            {
+                throw new LuaError( m_hardAbortMessage );
+            }
+            else if( results.arg1().checkboolean() == false )
+            {
+                throw new LuaError( results.arg(2).checkstring().toString() );
+            }
+            else
+            {
+                LuaValue filter = results.arg(2);
+                if( filter.isstring() )
                 {
                     m_eventFilter = filter.toString();
                 }
@@ -235,16 +243,16 @@ public class CobaltLuaMachine implements ILuaMachine
                     m_eventFilter = null;
                 }
             }
-
-            LuaThread mainThread = m_mainRoutine;
-            if( mainThread.getStatus().equals( "dead" ) )
+                        
+            LuaThread mainThread = (LuaThread)m_mainRoutine;
+            if( mainThread.getStatus().equals("dead") )
             {
                 m_mainRoutine = null;
             }
         }
         catch( LuaError e )
         {
-            m_mainRoutine.abandon();
+            ((LuaThread)m_mainRoutine).abandon();
             m_mainRoutine = null;
         }
         finally
@@ -254,13 +262,13 @@ public class CobaltLuaMachine implements ILuaMachine
         }
     }
 
-    @Override
+    @Override    
     public void softAbort( String abortMessage )
     {
         m_softAbortMessage = abortMessage;
     }
 
-    @Override
+    @Override    
     public void hardAbort( String abortMessage )
     {
         m_softAbortMessage = abortMessage;
@@ -272,87 +280,99 @@ public class CobaltLuaMachine implements ILuaMachine
     {
         return false;
     }
-
+    
     @Override
     public boolean restoreState( InputStream input )
     {
         return false;
     }
-
+    
     @Override
     public boolean isFinished()
     {
         return (m_mainRoutine == null);
     }
-
+    
     @Override
     public void unload()
     {
         if( m_mainRoutine != null )
         {
-            LuaThread mainThread = m_mainRoutine;
+            LuaThread mainThread = (LuaThread)m_mainRoutine;
             mainThread.abandon();
             m_mainRoutine = null;
         }
     }
-
+        
+    private void tryAbort() throws LuaError
+    {
+//        while( m_stopped )
+//        {
+//            m_coroutine_yield.call();
+//        }
+        
+        String abortMessage = m_softAbortMessage;
+        if( abortMessage != null )
+        {
+            m_softAbortMessage = null;
+            m_hardAbortMessage = null;
+            throw new LuaError( abortMessage );
+        }
+    }
+    
     private LuaTable wrapLuaObject( ILuaObject object )
     {
         LuaTable table = new LuaTable();
         String[] methods = object.getMethodNames();
-        for( int i = 0; i < methods.length; ++i )
+        for(int i=0; i<methods.length; ++i )
         {
-            if( methods[ i ] != null )
+            if( methods[i] != null )
             {
                 final int method = i;
                 final ILuaObject apiObject = object;
-                final String methodName = methods[ i ];
-                table.rawset( methodName, new VarArgFunction()
-                {
+                final String methodName = methods[i];
+                table.set( methodName, new VarArgFunction() {
                     @Override
-                    public Varargs invoke( final LuaState state, Varargs _args ) throws LuaError
+                    public Varargs invoke( Varargs _args )
                     {
+                        tryAbort();
                         Object[] arguments = toObjects( _args, 1 );
                         Object[] results;
                         try
                         {
-                            results = apiObject.callMethod( new ILuaContext()
-                            {
+                            results = apiObject.callMethod( new ILuaContext() {
                                 @Nonnull
                                 @Override
                                 public Object[] pullEvent( String filter ) throws LuaException, InterruptedException
                                 {
                                     Object[] results = pullEventRaw( filter );
-                                    if( results.length >= 1 && results[ 0 ].equals( "terminate" ) )
+                                    if( results.length >= 1 && results[0].equals( "terminate" ) )
                                     {
                                         throw new LuaException( "Terminated", 0 );
                                     }
                                     return results;
                                 }
-
+                                
                                 @Nonnull
                                 @Override
                                 public Object[] pullEventRaw( String filter ) throws InterruptedException
                                 {
                                     return yield( new Object[] { filter } );
                                 }
-
+                                
                                 @Nonnull
                                 @Override
                                 public Object[] yield( Object[] yieldArgs ) throws InterruptedException
                                 {
                                     try
                                     {
-                                        Varargs results = LuaThread.yield( state, toValues( yieldArgs ) );
+                                        LuaValue[] yieldValues = toValues( yieldArgs, 0 );
+                                        Varargs results = m_coroutine_yield.invoke( LuaValue.varargsOf( yieldValues ) );
                                         return toObjects( results, 1 );
                                     }
                                     catch( OrphanedThread e )
                                     {
                                         throw new InterruptedException();
-                                    }
-                                    catch( Throwable e )
-                                    {
-                                        throw new RuntimeException( e );
                                     }
                                 }
 
@@ -428,10 +448,10 @@ public class CobaltLuaMachine implements ILuaMachine
                                         Object[] response = pullEvent( "task_complete" );
                                         if( response.length >= 3 && response[ 1 ] instanceof Number && response[ 2 ] instanceof Boolean )
                                         {
-                                            if( ((Number) response[ 1 ]).intValue() == taskID )
+                                            if( ( (Number)response[ 1 ] ).intValue() == taskID )
                                             {
                                                 Object[] returnValues = new Object[ response.length - 3 ];
-                                                if( (Boolean) response[ 2 ] )
+                                                if( (Boolean)response[ 2 ] )
                                                 {
                                                     // Extract the return values from the event and return them
                                                     System.arraycopy( response, 3, returnValues, 0, returnValues.length );
@@ -440,9 +460,9 @@ public class CobaltLuaMachine implements ILuaMachine
                                                 else
                                                 {
                                                     // Extract the error message from the event and raise it
-                                                    if( response.length >= 4 && response[ 3 ] instanceof String )
+                                                    if( response.length >= 4 && response[3] instanceof String )
                                                     {
-                                                        throw new LuaException( (String) response[ 3 ] );
+                                                        throw new LuaException( (String)response[ 3 ] );
                                                     }
                                                     else
                                                     {
@@ -459,7 +479,7 @@ public class CobaltLuaMachine implements ILuaMachine
                         catch( InterruptedException e )
                         {
                             throw new OrphanedThread();
-                        }
+                        } 
                         catch( LuaException e )
                         {
                             throw new LuaError( e.getMessage(), e.getLevel() );
@@ -472,7 +492,7 @@ public class CobaltLuaMachine implements ILuaMachine
                             }
                             throw new LuaError( "Java Exception Thrown: " + t.toString(), 0 );
                         }
-                        return toValues( results );
+                        return LuaValue.varargsOf( toValues( results, 0 ) );
                     }
                 } );
             }
@@ -480,257 +500,192 @@ public class CobaltLuaMachine implements ILuaMachine
         return table;
     }
 
-    private LuaValue toValue( Object object, Map<Object, LuaValue> values )
+    private LuaValue toValue( Object object )
     {
         if( object == null )
         {
-            return Constants.NIL;
+            return LuaValue.NIL;
         }
         else if( object instanceof Number )
         {
-            double d = ((Number) object).doubleValue();
-            return valueOf( d );
+            double d = ((Number)object).doubleValue();
+            return LuaValue.valueOf( d );
         }
         else if( object instanceof Boolean )
         {
-            return valueOf( (Boolean) object );
+            boolean b = (Boolean) object;
+            return LuaValue.valueOf( b );
         }
         else if( object instanceof String )
         {
             String s = object.toString();
-            return valueOf( s );
+            return LuaValue.valueOf( s );
         }
         else if( object instanceof byte[] )
         {
             byte[] b = (byte[]) object;
-            return valueOf( Arrays.copyOf( b, b.length ) );
+            return LuaValue.valueOf( Arrays.copyOf( b, b.length ) );
         }
         else if( object instanceof Map )
         {
             // Table:
             // Start remembering stuff
-            if( values == null )
+            boolean clearWhenDone = false;
+            try
             {
-                values = new IdentityHashMap<>();
-            }
-            else if( values.containsKey( object ) )
-            {
-                return values.get( object );
-            }
-            LuaTable table = new LuaTable();
-            values.put( object, table );
-
-            // Convert all keys
-            for( Map.Entry<?, ?> pair : ((Map<?, ?>) object).entrySet() )
-            {
-                LuaValue key = toValue( pair.getKey(), values );
-                LuaValue value = toValue( pair.getValue(), values );
-                if( !key.isNil() && !value.isNil() )
+                if( m_valuesInProgress == null )
                 {
-                    table.rawset( key, value );
+                    m_valuesInProgress = new IdentityHashMap<>();
+                    clearWhenDone = true;
                 }
-            }
-            return table;
-        }
-        else if( object instanceof ILuaObject )
-        {
-            return wrapLuaObject( (ILuaObject) object );
-        }
-        else
-        {
-            return Constants.NIL;
-        }
-    }
-
-    private Varargs toValues( Object[] objects )
-    {
-        if( objects == null || objects.length == 0 )
-        {
-            return Constants.NONE;
-        }
-
-        LuaValue[] values = new LuaValue[ objects.length ];
-        for( int i = 0; i < values.length; ++i )
-        {
-            Object object = objects[ i ];
-            values[ i ] = toValue( object, null );
-        }
-        return varargsOf( values );
-    }
-
-    private static Object toObject( LuaValue value, Map<LuaValue, Object> objects )
-    {
-        switch( value.type() )
-        {
-            case Constants.TNIL:
-            case Constants.TNONE:
-            {
-                return null;
-            }
-            case Constants.TINT:
-            case Constants.TNUMBER:
-            {
-                return value.toDouble();
-            }
-            case Constants.TBOOLEAN:
-            {
-                return value.toBoolean();
-            }
-            case Constants.TSTRING:
-            {
-                return value.toString();
-            }
-            case Constants.TTABLE:
-            {
-                // Table:
-                // Start remembering stuff
-                if( objects == null )
+                else if( m_valuesInProgress.containsKey( object ) )
                 {
-                    objects = new IdentityHashMap<>();
+                    return m_valuesInProgress.get( object );
                 }
-                else if( objects.containsKey( value ) )
-                {
-                    return objects.get( value );
-                }
-                Map<Object, Object> table = new HashMap<>();
-                objects.put( value, table );
-
-                LuaTable luaTable = (LuaTable) value;
+                LuaValue table = new LuaTable();
+                m_valuesInProgress.put( object, table );
 
                 // Convert all keys
-                LuaValue k = Constants.NIL;
-                while( true )
+                for( Map.Entry<?, ?> pair : ((Map<?, ?>) object).entrySet() )
                 {
-                    Varargs keyValue;
-                    try
+                    LuaValue key = toValue( pair.getKey() );
+                    LuaValue value = toValue( pair.getValue() );
+                    if( !key.isnil() && !value.isnil() )
                     {
-                        keyValue = luaTable.next( k );
-                    }
-                    catch( LuaError luaError )
-                    {
-                        break;
-                    }
-                    k = keyValue.first();
-                    if( k.isNil() )
-                    {
-                        break;
-                    }
-
-                    LuaValue v = keyValue.arg( 2 );
-                    Object keyObject = toObject( k, objects );
-                    Object valueObject = toObject( v, objects );
-                    if( keyObject != null && valueObject != null )
-                    {
-                        table.put( keyObject, valueObject );
+                        table.set( key, value );
                     }
                 }
                 return table;
+            }
+            finally
+            {
+                // Clear (if exiting top level)
+                if( clearWhenDone )
+                {
+                    m_valuesInProgress = null;
+                }
+            }
+        }
+        else if( object instanceof ILuaObject )
+        {
+            return wrapLuaObject( (ILuaObject)object );
+        }
+        else
+        {
+            return LuaValue.NIL;
+        }        
+    }
+
+    private LuaValue[] toValues( Object[] objects, int leaveEmpty )
+    {
+        if( objects == null || objects.length == 0 ) 
+        {
+            return new LuaValue[ leaveEmpty ];
+        }
+        
+        LuaValue[] values = new LuaValue[objects.length + leaveEmpty];
+        for( int i=0; i<values.length; ++i )
+        {
+            if( i < leaveEmpty )
+            {
+                values[i] = null;
+                continue;
+            }
+            Object object = objects[i - leaveEmpty];
+            values[i] = toValue( object );
+        }
+        return values;
+    }
+
+    private Object toObject( LuaValue value )
+    {
+        switch( value.type() )
+        {
+            case LuaValue.TNIL:
+            case LuaValue.TNONE: 
+            {
+                return null;
+            }
+            case LuaValue.TINT:
+            case LuaValue.TNUMBER:
+            {
+                return value.todouble();
+            }
+            case LuaValue.TBOOLEAN:
+            {
+                return value.toboolean();
+            }
+            case LuaValue.TSTRING:
+            {
+                LuaString str = value.checkstring();
+                return str.tojstring();
+            }
+            case LuaValue.TTABLE:
+            {
+                // Table:
+                boolean clearWhenDone = false;
+                try
+                {
+                    // Start remembering stuff
+                    if( m_objectsInProgress == null )
+                    {
+                        m_objectsInProgress = new IdentityHashMap<>();
+                        clearWhenDone = true;
+                    }
+                    else if( m_objectsInProgress.containsKey( value ) )
+                    {
+                        return m_objectsInProgress.get( value );
+                    }
+                    Map<Object, Object> table = new HashMap<>();
+                    m_objectsInProgress.put( value, table );
+
+                    // Convert all keys
+                    LuaValue k = LuaValue.NIL;
+                    while( true )
+                    {
+                        Varargs keyValue = value.next( k );
+                        k = keyValue.arg1();
+                        if( k.isnil() )
+                        {
+                            break;
+                        }
+
+                        LuaValue v = keyValue.arg(2);
+                        Object keyObject = toObject(k);
+                        Object valueObject = toObject(v);
+                        if( keyObject != null && valueObject != null )
+                        {
+                            table.put( keyObject, valueObject );
+                        }
+                    }
+                    return table;
+                }
+                finally
+                {
+                    // Clear (if exiting top level)
+                    if( clearWhenDone )
+                    {
+                        m_objectsInProgress = null;
+                    }
+                }
             }
             default:
             {
                 return null;
             }
-        }
+        }        
     }
-
-    private static Object[] toObjects( Varargs values, int startIdx )
+    
+    private Object[] toObjects( Varargs values, int startIdx )
     {
-        int count = values.count();
+        int count = values.narg();
         Object[] objects = new Object[ count - startIdx + 1 ];
-        for( int n = startIdx; n <= count; ++n )
+        for( int n=startIdx; n<=count; ++n )
         {
             int i = n - startIdx;
-            LuaValue value = values.arg( n );
-            objects[ i ] = toObject( value, null );
+            LuaValue value = values.arg(n);
+            objects[i] = toObject( value );
         }
         return objects;
-    }
-
-    private static class PrefixLoader extends VarArgFunction
-    {
-        private static final LuaString FUNCTION_STR = valueOf( "function" );
-        private static final LuaString EQ_STR = valueOf( "=" );
-
-        @Override
-        public Varargs invoke( LuaState state, Varargs args ) throws LuaError
-        {
-            switch (opcode)
-            {
-                case 0: // "load", // ( func [,chunkname] ) -> chunk | nil, msg
-                {
-                    LuaValue func = args.arg( 1 ).checkFunction();
-                    LuaString chunkname = args.arg( 2 ).optLuaString( FUNCTION_STR );
-                    if( !chunkname.startsWith( '@' ) && !chunkname.startsWith( '=' ) )
-                    {
-                        chunkname = OperationHelper.concat( EQ_STR, chunkname );
-                    }
-                    return BaseLib.loadStream( state, new StringInputStream( state, func ), chunkname );
-                }
-                case 1: // "loadstring", // ( string [,chunkname] ) -> chunk | nil, msg
-                {
-                    LuaString script = args.arg( 1 ).checkLuaString();
-                    LuaString chunkname = args.arg( 2 ).optLuaString( script );
-                    if( !chunkname.startsWith( '@' ) && !chunkname.startsWith( '=' ) )
-                    {
-                        chunkname = OperationHelper.concat( EQ_STR, chunkname );
-                    }
-                    return BaseLib.loadStream( state, script.toInputStream(), chunkname );
-                }
-            }
-
-            return NONE;
-        }
-    }
-
-    private static class StringInputStream extends InputStream
-    {
-        private final LuaState state;
-        private final LuaValue func;
-        private byte[] bytes;
-        private int offset, remaining = 0;
-
-        public StringInputStream( LuaState state, LuaValue func )
-        {
-            this.state = state;
-            this.func = func;
-        }
-
-        @Override
-        public int read() throws IOException
-        {
-            if( remaining <= 0 )
-            {
-                LuaValue s;
-                try
-                {
-                    s = OperationHelper.call( state, func );
-                } catch (LuaError e)
-                {
-                    throw new IOException( e );
-                }
-
-                if( s.isNil() )
-                {
-                    return -1;
-                }
-                LuaString ls;
-                try
-                {
-                    ls = s.strvalue();
-                } catch (LuaError e)
-                {
-                    throw new IOException( e );
-                }
-                bytes = ls.bytes;
-                offset = ls.offset;
-                remaining = ls.length;
-                if( remaining <= 0 )
-                {
-                    return -1;
-                }
-            }
-            --remaining;
-            return bytes[offset++];
-        }
     }
 }
